@@ -4,6 +4,10 @@ Unreleased
 
 **New method**
 
+- ``LeVLJEPA``: bidirectional vision-language prediction with stop-gradient
+  targets and per-modality SIGReg. Includes injectable encoders, a composable
+  forward function, CPU training/resume and distributed-gradient tests, and a
+  reduced Flickr8k example with documented retrieval results and limitations.
 - ``PMSN`` (Prior Matching for Siamese Networks): extends ``MSN`` by replacing
   its uniform-prior mean-entropy regulariser with a KL-divergence term against
   an arbitrary prior distribution over prototypes (power-law by default,
