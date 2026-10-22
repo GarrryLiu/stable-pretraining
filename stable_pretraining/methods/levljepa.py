@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from torch import nn
 
 from stable_pretraining import Module
+from stable_pretraining.backbone import MLP
 from stable_pretraining.forward import levljepa
 from stable_pretraining.losses import LeVLJEPALoss
 
@@ -20,12 +21,17 @@ def _head(in_dim: int, hidden_dims: Sequence[int], out_dim: int) -> nn.Module:
         raise ValueError(
             "all encoder, hidden and embedding dimensions must be positive"
         )
-    layers = []
-    for i, (source, target) in enumerate(zip(dims[:-1], dims[1:])):
-        layers.append(nn.Linear(source, target))
-        if i < len(dims) - 2:
-            layers.extend([nn.BatchNorm1d(target), nn.GELU()])
-    return nn.Sequential(*layers)
+    head = MLP(
+        in_channels=in_dim,
+        hidden_channels=[*hidden_dims, out_dim],
+        norm_layer="batch_norm",
+        activation_layer=nn.GELU,
+        dropout=0.0,
+    )
+    # Zero-dropout modules shift parameter names in existing LeVLJEPA checkpoints.
+    return nn.Sequential(
+        *(layer for layer in head if not isinstance(layer, nn.Dropout))
+    )
 
 
 class LeVLJEPA(Module):

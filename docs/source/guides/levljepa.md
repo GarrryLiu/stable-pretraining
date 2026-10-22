@@ -64,6 +64,22 @@ time distributed detection and collective-return handling cannot provide the
 runtime and autograd behavior needed here; a private regularizer implements
 the same statistic with explicit distributed semantics.
 
+## Framework reuse
+
+`LeVLJEPA` inherits `spt.Module` and supplies the method forward function;
+training, optimization and checkpoint resume use the existing Module/Manager
+path. Projection and predictor heads use the framework's `backbone.MLP`
+with BatchNorm/GELU. Zero-dropout modules are omitted to retain the existing
+LeVLJEPA checkpoint parameter names. Three state-layout regression cases
+cover linear, one-hidden-layer and two-hidden-layer heads.
+
+The example's `LossHistory` callback records epoch component means for its
+JSON report and updates the caption dataset epoch. It does not stop training,
+replace EarlyStopping, implement optimization, or implement checkpoint saving.
+The small dataset adapter supplies Flickr8k-specific EOS, caption selection
+and image-identity checks. Its CLIP control reuses the paired encoder forward
+and existing `CLIPLoss`; no separate training framework is introduced.
+
 ## API
 
 ```python
@@ -302,10 +318,11 @@ It compares both the loss and every parameter gradient. It needs permission
 to create local network sockets; a restricted runtime can block gloo before
 the method is reached. Such a failure is **not** a distributed pass.
 
-Targeted verification includes 18 formula/API unit cases, five existing CLIP
+Targeted verification includes 18 formula/API unit cases, three head checkpoint
+layout cases, five existing CLIP
 loss cases, two Manager training/full-resume cases (tiny and real ViT/GPT-2
 encoders), two real two-process CPU gloo comparisons, and an Apple MPS
-real-encoder optimizer test: 28 tests on the Mac. The MPS case skips on hosts
+real-encoder optimizer test: 31 tests on the Mac. The MPS case skips on hosts
 without MPS. The real-encoder cases use reduced BatchNorm/GELU heads. In the
 DDP reference, each rank's batch passes through the heads separately before
 concatenating features, matching ordinary DDP's rank-local BatchNorm semantics.
@@ -313,7 +330,7 @@ The original linear-head case still compares a full concatenated-batch forward.
 
 The CPU gloo gradient tests passed on macOS with local sockets enabled and
 `GLOO_SOCKET_IFNAME=lo0`. Apple MPS forward/backward and optimizer updates also
-passed with real encoders and BatchNorm heads. The same targeted selection
+passed with real encoders and BatchNorm heads. The preceding 28-case selection
 on Linux aarch64 reported 27 passed and one expected MPS skip; both real
 two-process CPU gloo comparisons passed with `GLOO_SOCKET_IFNAME=lo`.
 CUDA/NCCL, multi-node training, and synchronized BatchNorm remain unverified.

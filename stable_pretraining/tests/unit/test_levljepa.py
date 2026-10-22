@@ -268,3 +268,31 @@ def test_example_evaluation_restores_training_mode():
     model.eval()
     evaluate(model, loader, torch.device("cpu"))
     assert not model.training
+
+
+@pytest.mark.parametrize(
+    "hidden_dims, linear_indices, batchnorm_indices",
+    [((), [0], []), ((7,), [0, 3], [1]), ((7, 9), [0, 3, 6], [1, 4])],
+)
+def test_framework_mlp_preserves_legacy_checkpoint_keys(
+    hidden_dims, linear_indices, batchnorm_indices
+):
+    """Shared MLP construction must keep already-trained head state names."""
+    from stable_pretraining.methods.levljepa import _head
+
+    head = _head(4, hidden_dims, 8)
+    expected = {
+        f"{index}.{name}" for index in linear_indices for name in ("weight", "bias")
+    }
+    expected.update(
+        f"{index}.{name}"
+        for index in batchnorm_indices
+        for name in (
+            "weight",
+            "bias",
+            "running_mean",
+            "running_var",
+            "num_batches_tracked",
+        )
+    )
+    assert set(head.state_dict()) == expected
