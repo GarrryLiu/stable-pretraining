@@ -5,11 +5,14 @@ LeVLJEPA on Flickr8k
 Run ``python examples/levljepa_flickr8k.py --help``. No tracking account,
 pretrained weights or external uploads are used. This reduced recipe validates
 integration and learning behavior; it is not the paper's DataComp experiment.
+Use ``--method clip`` for a control with shared encoders and marginal heads;
+CLIP omits LeVLJEPA's cross-modal predictors and uses embedding retrieval.
 """
 
 import argparse
 import hashlib
 import json
+import random
 from pathlib import Path
 
 import lightning as pl
@@ -34,14 +37,26 @@ class CaptionPairs(Dataset):
         image_size: Square input resolution.
         max_length: Padded token length including EOS.
         training: Enable mild image augmentation.
+        random_captions: Sample from available captions during training.
+        seed: Seed for caption choices, independent of model RNG consumption.
     """
 
     def __init__(
-        self, rows, tokenizer, image_size: int, max_length: int, training: bool
+        self,
+        rows,
+        tokenizer,
+        image_size: int,
+        max_length: int,
+        training: bool,
+        random_captions: bool = False,
+        seed: int = 0,
     ) -> None:
         if max_length < 2:
             raise ValueError("max_length must leave room for content and EOS")
         self.images, self.captions, self.fingerprints = [], [], []
+        self.caption_groups = []
+        self.seed, self.epoch = seed, 0
+        self.random_captions = training and random_captions
         seen = set()
         for row in rows:
             image = row["image"].convert("RGB")
@@ -53,9 +68,17 @@ class CaptionPairs(Dataset):
             seen.add(fingerprint)
             self.images.append(image.copy())
             self.captions.append(row["caption_0"])
+            captions = (
+                [row[f"caption_{i}"] for i in range(5)]
+                if self.random_captions
+                else [row["caption_0"]]
+            )
+            if any(not isinstance(c, str) or not c.strip() for c in captions):
+                raise ValueError("expected nonempty Flickr8k captions")
+            self.caption_groups.append(captions)
             self.fingerprints.append(fingerprint)
         encoded = tokenizer(
-            self.captions,
+            [caption for group in self.caption_groups for caption in group],
             add_special_tokens=False,
             truncation=True,
             max_length=max_length - 1,
@@ -68,6 +91,9 @@ class CaptionPairs(Dataset):
             sequence = content + [tokenizer.eos_token_id]
             self.ids[index, : len(sequence)] = torch.tensor(sequence)
             self.mask[index, : len(sequence)] = 1
+        count = 5 if self.random_captions else 1
+        self.ids = self.ids.reshape(len(self.images), count, max_length)
+        self.mask = self.mask.reshape(len(self.images), count, max_length)
         spatial = (
             [transforms.RandomResizedCrop(image_size, scale=(0.8, 1.0))]
             if training
@@ -85,11 +111,36 @@ class CaptionPairs(Dataset):
         return len(self.images)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        # Keep caption choices identical across objectives and reproducible on resume.
+        caption = random.Random(f"{self.seed}:{self.epoch}:{index}").randrange(
+            len(self.caption_groups[index])
+        )
         return {
             "image": self.transform(self.images[index]),
-            "input_ids": self.ids[index],
-            "attention_mask": self.mask[index],
+            "input_ids": self.ids[index, caption],
+            "attention_mask": self.mask[index, caption],
         }
+
+
+def clip_forward(
+    self, batch: dict[str, torch.Tensor], stage: str
+) -> dict[str, torch.Tensor]:
+    """Train a CLIP control with the same encoders and marginal heads.
+
+    Args:
+        self: Module exposing the shared encoder and projection contract.
+        batch: Paired image and token tensors.
+        stage: Framework training, validation, test, or prediction stage.
+
+    Returns:
+        Encoded batch with symmetric contrastive loss outside prediction.
+    """
+    output = spt.forward.levljepa(self, batch, "predict")
+    if stage != "predict":
+        output["loss"] = self.clip_loss(
+            output["image_embedding"], output["text_embedding"]
+        )
+    return output
 
 
 class LossHistory(Callback):
@@ -104,6 +155,7 @@ class LossHistory(Callback):
             raise RuntimeError(
                 "Training started in eval mode; restore model.train() after evaluation"
             )
+        trainer.train_dataloader.dataset.epoch = trainer.current_epoch
         self._values = []
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
@@ -111,6 +163,7 @@ class LossHistory(Callback):
             {
                 key: float(outputs[key].detach())
                 for key in ("loss", "prediction_loss", "sigreg_vision", "sigreg_text")
+                if key in outputs
             }
         )
 
@@ -130,10 +183,10 @@ class LossHistory(Callback):
 
 @torch.no_grad()
 def evaluate(model: spt.Module, loader: DataLoader, device: torch.device) -> dict:
-    """Measure directional predictor-to-target retrieval over the full holdout.
+    """Measure retrieval over the full holdout in the selected objective space.
 
     Args:
-        model: LeVLJEPA instance.
+        model: LeVLJEPA instance or CLIP control Module.
         loader: Deterministic image/caption pairs.
         device: Evaluation device.
 
@@ -162,10 +215,18 @@ def evaluate(model: spt.Module, loader: DataLoader, device: torch.device) -> dic
     captions = loader.dataset.captions
     positives = torch.tensor([[a == b for b in captions] for a in captions])
     result = {"samples": len(captions), "random_r1": float(positives.float().mean())}
-    for name, prediction, target in (
-        ("image_to_text", "image_prediction", "text_embedding"),
-        ("text_to_image", "text_prediction", "image_embedding"),
-    ):
+    pairs = (
+        (
+            ("image_to_text", "image_embedding", "text_embedding"),
+            ("text_to_image", "text_embedding", "image_embedding"),
+        )
+        if getattr(model, "retrieval_mode", "prediction") == "embedding"
+        else (
+            ("image_to_text", "image_prediction", "text_embedding"),
+            ("text_to_image", "text_prediction", "image_embedding"),
+        )
+    )
+    for name, prediction, target in pairs:
         scores = (
             F.normalize(vectors[prediction], dim=-1)
             @ F.normalize(vectors[target], dim=-1).T
@@ -189,15 +250,19 @@ def main() -> None:
     parser.add_argument(
         "--output", type=Path, default=Path("outputs/levljepa-flickr8k")
     )
+    parser.add_argument("--method", choices=("levljepa", "clip"), default="levljepa")
     parser.add_argument("--dataset", default="jxie/flickr8k")
     parser.add_argument(
         "--revision", default="56f58c967835f7c508d684f36bd7897cca9d7634"
     )
     parser.add_argument("--tokenizer", default="gpt2", help="HF ID or local directory")
     parser.add_argument(
-        "--train-parquet", help="Optional local train shard, same Flickr8k columns"
+        "--train-parquet",
+        nargs="+",
+        help="Optional local train shards, Flickr8k columns",
     )
     parser.add_argument("--val-parquet", help="Optional local validation shard")
+    parser.add_argument("--caption-mode", choices=("first", "random"), default="first")
     parser.add_argument("--train-samples", type=int, default=1024)
     parser.add_argument("--val-samples", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=20)
@@ -251,7 +316,15 @@ def main() -> None:
     val_rows = val_rows.shuffle(seed=args.seed).select(
         range(min(args.val_samples, len(val_rows)))
     )
-    train = CaptionPairs(train_rows, tokenizer, args.image_size, args.text_length, True)
+    train = CaptionPairs(
+        train_rows,
+        tokenizer,
+        args.image_size,
+        args.text_length,
+        True,
+        random_captions=args.caption_mode == "random",
+        seed=args.seed,
+    )
     val = CaptionPairs(val_rows, tokenizer, args.image_size, args.text_length, False)
     if set(train.fingerprints) & set(val.fingerprints):
         raise ValueError("train/validation image overlap detected")
@@ -297,6 +370,19 @@ def main() -> None:
         seed=args.seed,
         optim={"optimizer": {"type": "AdamW", "lr": args.lr, "weight_decay": 0.01}},
     )
+    if args.method == "clip":
+        model = spt.Module(
+            forward=clip_forward,
+            vision_encoder=model.vision_encoder,
+            text_encoder=model.text_encoder,
+            vision_pre_proj=model.vision_pre_proj,
+            text_pre_proj=model.text_pre_proj,
+            projector_vision=torch.nn.Identity(),
+            projector_text=torch.nn.Identity(),
+            clip_loss=spt.losses.CLIPLoss(temperature=0.07),
+            retrieval_mode="embedding",
+            optim={"optimizer": {"type": "AdamW", "lr": args.lr, "weight_decay": 0.01}},
+        )
     if args.resume:
         model.load_state_dict(
             torch.load(args.resume.resolve(), map_location="cpu", weights_only=False)[
@@ -340,7 +426,12 @@ def main() -> None:
             "val_samples": len(val),
             "train_image_hashes": train.fingerprints,
             "val_image_hashes": val.fingerprints,
-            "caption_column": "caption_0",
+            "caption_column": (
+                "caption_0..caption_4; seeded per-image per-epoch training choice"
+                if args.caption_mode == "random"
+                else "caption_0"
+            ),
+            "validation_caption_column": "caption_0",
             "split": "existing train/validation; seeded subset; exact image deduplication",
         },
         "parameters": sum(p.numel() for p in model.parameters()),
