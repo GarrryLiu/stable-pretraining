@@ -12,6 +12,7 @@ CLIP omits LeVLJEPA's cross-modal predictors and uses embedding retrieval.
 import argparse
 import hashlib
 import json
+import math
 import random
 from pathlib import Path
 
@@ -192,7 +193,8 @@ def evaluate(model: spt.Module, loader: DataLoader, device: torch.device) -> dic
 
     Returns:
         R@1/R@5, random R@1, marginal standard deviations and sample count.
-        Identical caption strings are treated as interchangeable positives.
+        Positives use paired image identity, never equality of caption strings.
+        CaptionPairs deduplicates images, leaving one caption per gallery image.
     """
     was_training = model.training
     model.eval()
@@ -212,9 +214,10 @@ def evaluate(model: spt.Module, loader: DataLoader, device: torch.device) -> dic
         for key in collected:
             collected[key].append(output[key].float().cpu())
     vectors = {key: torch.cat(value) for key, value in collected.items()}
-    captions = loader.dataset.captions
-    positives = torch.tensor([[a == b for b in captions] for a in captions])
-    result = {"samples": len(captions), "random_r1": float(positives.float().mean())}
+    samples = vectors["image_embedding"].shape[0]
+    # Distinct images can have identical captions; text equality is not identity.
+    positives = torch.eye(samples, dtype=torch.bool)
+    result = {"samples": samples, "random_r1": 1 / samples}
     pairs = (
         (
             ("image_to_text", "image_embedding", "text_embedding"),
@@ -273,6 +276,14 @@ def main() -> None:
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--projections", type=int, default=128)
     parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--lambda-vision", type=float, default=0.02)
+    parser.add_argument("--lambda-text", type=float, default=0.02)
+    parser.add_argument("--alignment", choices=("mse", "cosine"), default="mse")
+    parser.add_argument("--warmup-fraction", type=float, default=0.0)
+    parser.add_argument("--gradient-clip-val", type=float, default=0.0)
+    parser.add_argument(
+        "--image-augmentation", choices=("crop", "resize"), default="crop"
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--accelerator", choices=("auto", "cpu", "gpu"), default="auto")
@@ -280,6 +291,12 @@ def main() -> None:
         "--resume", type=Path, help="Full local .ckpt, resumes optimizer and step"
     )
     args = parser.parse_args()
+    if not math.isfinite(args.lr) or args.lr <= 0:
+        parser.error("lr must be finite and positive")
+    if not 0 <= args.warmup_fraction < 1:
+        parser.error("warmup fraction must lie in [0, 1)")
+    if not math.isfinite(args.gradient_clip_val) or args.gradient_clip_val < 0:
+        parser.error("gradient clip value must be finite and nonnegative")
     if args.width % 4 or args.image_size % 8 or args.batch_size < 2:
         parser.error("width must be divisible by 4, image size by 8, batch size >=2")
     if (
@@ -289,6 +306,20 @@ def main() -> None:
         < 1
     ):
         parser.error("sample counts, epochs, layers and threads must be positive")
+    resume_checkpoint = None
+    if args.resume:
+        resume_checkpoint = torch.load(
+            args.resume.resolve(), map_location="cpu", weights_only=False
+        )
+        saved_schedulers = resume_checkpoint.get("lr_schedulers", [])
+        if saved_schedulers:
+            saved_warmup = "warmup_steps" in saved_schedulers[0]
+            if saved_warmup != bool(args.warmup_fraction):
+                parser.error(
+                    "resume must use the checkpoint's scheduler family: "
+                    "set --warmup-fraction positive for warmup checkpoints, "
+                    "or zero for the original cosine-only checkpoints"
+                )
     args.output.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(args.threads)
     pl.seed_everything(args.seed, workers=True)
@@ -325,6 +356,14 @@ def main() -> None:
         random_captions=args.caption_mode == "random",
         seed=args.seed,
     )
+    if args.image_augmentation == "resize":
+        train.transform = transforms.Compose(
+            [
+                transforms.Resize((args.image_size, args.image_size)),
+                transforms.ToTensor(),
+                transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+            ]
+        )
     val = CaptionPairs(val_rows, tokenizer, args.image_size, args.text_length, False)
     if set(train.fingerprints) & set(val.fingerprints):
         raise ValueError("train/validation image overlap detected")
@@ -358,6 +397,22 @@ def main() -> None:
             embd_pdrop=0,
         )
     )
+    optim = {"optimizer": {"type": "AdamW", "lr": args.lr, "weight_decay": 0.01}}
+    if args.warmup_fraction:
+        total_steps = len(train_loader) * args.epochs
+        warmup_steps = max(1, int(total_steps * args.warmup_fraction))
+        if warmup_steps >= total_steps:
+            parser.error("warmup must leave at least one decay step")
+        optim.update(
+            scheduler={
+                "type": "LinearWarmupCosineAnnealingLR",
+                "warmup_steps": warmup_steps,
+                "max_steps": total_steps,
+                "warmup_start_lr": args.lr * 0.01,
+                "eta_min": args.lr * 0.1,
+            },
+            interval="step",
+        )
     model = spt.LeVLJEPA(
         vision_encoder=vision,
         text_encoder=text,
@@ -366,9 +421,12 @@ def main() -> None:
         embedding_dim=args.width,
         pre_projection_dims=(args.width * 2,),
         predictor_dims=(args.width * 2, args.width * 2),
+        lambda_vision=args.lambda_vision,
+        lambda_text=args.lambda_text,
+        alignment=args.alignment,
         num_projections=args.projections,
         seed=args.seed,
-        optim={"optimizer": {"type": "AdamW", "lr": args.lr, "weight_decay": 0.01}},
+        optim=optim,
     )
     if args.method == "clip":
         model = spt.Module(
@@ -381,14 +439,10 @@ def main() -> None:
             projector_text=torch.nn.Identity(),
             clip_loss=spt.losses.CLIPLoss(temperature=0.07),
             retrieval_mode="embedding",
-            optim={"optimizer": {"type": "AdamW", "lr": args.lr, "weight_decay": 0.01}},
+            optim=optim,
         )
-    if args.resume:
-        model.load_state_dict(
-            torch.load(args.resume.resolve(), map_location="cpu", weights_only=False)[
-                "state_dict"
-            ]
-        )
+    if resume_checkpoint is not None:
+        model.load_state_dict(resume_checkpoint["state_dict"])
     device = torch.device(
         "cuda" if args.accelerator != "cpu" and torch.cuda.is_available() else "cpu"
     )
@@ -405,6 +459,7 @@ def main() -> None:
         num_sanity_val_steps=0,
         callbacks=[history],
         log_every_n_steps=1,
+        gradient_clip_val=args.gradient_clip_val,
     )
     spt.Manager(
         trainer=trainer,

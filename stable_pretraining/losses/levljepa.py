@@ -59,17 +59,26 @@ class _SlicedGaussianRegularizer(nn.Module):
 
         # Characteristic functions need fp32 even under bf16/fp16 autocast.
         with torch.autocast(device_type=embedding.device.type, enabled=False):
+            t, phi, weights = self.t.float(), self.phi.float(), self.weights.float()
+            if self.t.dtype != torch.float32:
+                # .half()/.bfloat16() round buffers before autocast is disabled.
+                # Reconstruct quadrature constants rather than upcast rounded ones.
+                t = torch.linspace(0, 3, self.t.numel(), device=embedding.device)
+                phi = torch.exp(-t.square() / 2)
+                weights = torch.full_like(t, 6 / (t.numel() - 1))
+                weights[[0, -1]] /= 2
+                weights *= phi
             projected = embedding.float() @ directions
-            phase = projected.unsqueeze(-1) * self.t.float()
+            phase = projected.unsqueeze(-1) * t
             moments = torch.stack((phase.cos().sum(0), phase.sin().sum(0)))
             count = embedding.new_tensor(embedding.shape[0], dtype=torch.float32)
             if distributed:
                 moments = all_reduce(moments, op=dist.ReduceOp.SUM)
                 dist.all_reduce(count, op=dist.ReduceOp.SUM)
             moments = moments / count
-            error = (moments[0] - self.phi.float()).square() + moments[1].square()
+            error = (moments[0] - phi).square() + moments[1].square()
             # Match the reference's LOCAL-batch scaling for equal DDP batches.
-            return (error @ self.weights.float()).mean() * (count / world_size)
+            return (error @ weights).mean() * (count / world_size)
 
 
 class LeVLJEPALoss(nn.Module):

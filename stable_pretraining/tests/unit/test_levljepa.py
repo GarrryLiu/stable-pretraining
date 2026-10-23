@@ -296,3 +296,136 @@ def test_framework_mlp_preserves_legacy_checkpoint_keys(
         )
     )
     assert set(head.state_dict()) == expected
+
+
+@pytest.mark.parametrize("saved_warmup", [False, True])
+def test_example_rejects_incompatible_resume_scheduler(
+    tmp_path, monkeypatch, capsys, saved_warmup
+):
+    """Reject a scheduler-family mismatch before any dataset/tokenizer downloads."""
+    import sys
+
+    from examples import levljepa_flickr8k as example
+
+    checkpoint = tmp_path / "resume.ckpt"
+    torch.save(
+        {"lr_schedulers": [{"warmup_steps": 2} if saved_warmup else {"T_max": 6}]},
+        checkpoint,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "levljepa_flickr8k.py",
+            "--resume",
+            str(checkpoint),
+            "--warmup-fraction",
+            "0" if saved_warmup else "0.05",
+        ],
+    )
+
+    def unexpected_download(*args, **kwargs):
+        pytest.fail("scheduler mismatch must be rejected before tokenizer loading")
+
+    monkeypatch.setattr(example.AutoTokenizer, "from_pretrained", unexpected_download)
+    with pytest.raises(SystemExit) as error:
+        example.main()
+    assert error.value.code == 2
+    assert "checkpoint's scheduler family" in capsys.readouterr().err
+
+
+def test_sigreg_pairwise_kernel_value_and_analytic_gradient():
+    """Check the EP expansion without forming empirical characteristic means."""
+    from stable_pretraining.losses.levljepa import _SlicedGaussianRegularizer
+
+    values = torch.tensor([-2.0, -0.4, 0.25, 1.6], requires_grad=True)
+    regularizer = _SlicedGaussianRegularizer(7, 17, False, 19).eval()
+    result = regularizer(values[:, None])
+    # In one dimension each unit direction is +/-1; the statistic is even.
+    x = values.detach().double()
+    t = torch.arange(17, dtype=torch.float64) * (3 / 16)
+    phi = torch.exp(-t.square() / 2)
+    weights = torch.full_like(t, 2 * 3 / 16)
+    weights[[0, -1]] /= 2
+    weights *= phi
+    pair_phase = (x[:, None, None] - x[None, :, None]) * t
+    phase = x[:, None] * t
+    expected = (
+        weights
+        * (
+            pair_phase.cos().sum((0, 1)) / len(x)
+            - 2 * phi * phase.cos().sum(0)
+            + len(x) * phi.square()
+        )
+    ).sum()
+    derivative = (
+        weights
+        * (-2 / len(x) * t * pair_phase.sin().sum(1) + 2 * phi * t * phase.sin())
+    ).sum(-1)
+    torch.testing.assert_close(result.double(), expected, rtol=2e-6, atol=2e-6)
+    result.backward()
+    torch.testing.assert_close(values.grad.double(), derivative, rtol=2e-6, atol=2e-6)
+
+
+def test_example_identical_captions_do_not_merge_distinct_image_positives():
+    from examples.levljepa_flickr8k import evaluate
+
+    class Rows(list):
+        captions = ["same caption", "same caption"]
+
+    class SwappedModel(nn.Module):
+        retrieval_mode = "embedding"
+
+        def forward(self, batch, stage):
+            image = batch["image"]
+            text = image.flip(-1)
+            return {
+                "image_embedding": image,
+                "text_embedding": text,
+                "image_prediction": image,
+                "text_prediction": text,
+            }
+
+    loader = torch.utils.data.DataLoader(
+        Rows(
+            [{"image": torch.tensor([1.0, 0.0])}, {"image": torch.tensor([0.0, 1.0])}]
+        ),
+        batch_size=2,
+    )
+    metrics = evaluate(SwappedModel(), loader, torch.device("cpu"))
+    assert metrics["image_to_text_r1"] == metrics["text_to_image_r1"] == 0
+    assert metrics["random_r1"] == 0.5
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_explicit_low_precision_module_keeps_fp32_quadrature(dtype):
+    """Upcasting already-rounded phi/weights does not restore fp32 accuracy."""
+    torch.manual_seed(57)
+    tensors = [torch.randn(9, 5, requires_grad=True) for _ in range(4)]
+    criterion = LeVLJEPALoss(num_projections=16).eval()
+    converted = copy.deepcopy(criterion).to(dtype=dtype)
+    reference = criterion(*tensors)["loss"]
+    actual = converted(*tensors)["loss"]
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    for observed, expected in zip(
+        torch.autograd.grad(actual, tensors), torch.autograd.grad(reference, tensors)
+    ):
+        torch.testing.assert_close(observed, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("width", [3, 7])
+def test_prediction_reduction_is_elementwise_mean_and_directional_average(width):
+    """Fix the executable convention explicitly; do not silently use summed MSE."""
+    image = torch.zeros(4, width)
+    text = torch.zeros_like(image)
+    image_prediction = torch.ones_like(image, requires_grad=True)
+    text_prediction = torch.zeros_like(image, requires_grad=True)
+    result = LeVLJEPALoss(num_projections=4)(
+        image, text, image_prediction, text_prediction
+    )
+    assert result["prediction_loss"].item() == 0.5
+    result["prediction_loss"].backward()
+    torch.testing.assert_close(
+        image_prediction.grad, torch.full_like(image, 1 / (4 * width))
+    )
+    torch.testing.assert_close(text_prediction.grad, torch.zeros_like(image))
