@@ -15,7 +15,9 @@ Unreleased
   CUDA training and a frozen, overlap-filtered Flickr30k transfer evaluation,
   including weak retrieval results and remaining limitations. Also records a
   fixed CC3M-subset comparison and frozen STL-10/ADE20K probes, with
-  random-encoder controls and the observed gaps to CLIP.
+  random-encoder controls and the observed gaps to CLIP. Adds a reproducible
+  frozen ADE20K linear-probe example with native/author/random checkpoint
+  controls, host-RAM caching, and original-resolution confusion metrics.
 - ``PMSN`` (Prior Matching for Siamese Networks): extends ``MSN`` by replacing
   its uniform-prior mean-entropy regulariser with a KL-divergence term against
   an arbitrary prior distribution over prototypes (power-law by default,
