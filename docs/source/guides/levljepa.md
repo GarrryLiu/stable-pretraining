@@ -334,6 +334,51 @@ These observations establish executable reduced training, not paper-scale
 quality or method superiority. Full datasets, weights, environments, raw
 predictions and exploratory experiment adapters remain outside the PR.
 
+## Full-capacity subset follow-up
+
+A separate seed-42 comparison used the pinned author repository's default
+architecture: ViT-B/16 at 224px, a 12-layer GPT-2 text encoder, 768-dimensional
+embeddings, 2,048-wide projection/prediction heads and 4,096 SIGReg projections.
+Both objectives trained from matched encoder/projection initialization on
+32,000 CC12M-subset pairs, using a true batch of 32 for 50,000 updates
+(1.6 million sample exposures each). This follows the repository-default
+profile, not the paper's full-scale training or the released DataComp weights.
+
+Final directional retrieval used a separate 1,000-pair validation gallery with
+one paired positive per query; random R@1 is 0.10%:
+
+| Method | Image-to-text R@1 | Text-to-image R@1 |
+|---|---:|---:|
+| LeVLJEPA | 0.40% | 0.60% |
+| CLIP control | 0.90% | 0.80% |
+
+Both final model-only checkpoints passed strict reload checks. These are
+single-seed validation results, not a new independent test or a controlled
+scaling comparison with the earlier reduced-encoder experiments.
+
+A no-update diagnostic used the first 512 training and first 512 validation
+pairs as equal-sized galleries:
+
+| Method | Training image/text R@1 | Validation image/text R@1 |
+|---|---:|---:|
+| LeVLJEPA | 12.50% / 23.44% | 0.98% / 1.17% |
+| CLIP control | 73.83% / 73.24% | 1.56% / 1.56% |
+
+Both methods show substantial training/validation gaps. In four augmented
+LeVLJEPA training-mode batches of 32 pairs, the weighted regularizer-to-
+prediction encoder-gradient norm ratio was 0.13-0.53 for vision and
+0.044-0.097 for text. The combined gradient did not oppose the prediction
+gradient in these batches. Feature variance and effective rank did not
+indicate a constant representation. These bounded checks support a
+poor-generalization diagnosis; they neither isolate its cause nor exclude
+other training or implementation problems.
+
+The two new full-capacity frozen ADE20K attempts failed before head training:
+the framework rejected the relative cache path derived from the supplied
+relative output directory. They provide no ADE metric and must not be counted
+as successful evaluations. Earlier completed reduced-encoder and author-weight
+ADE results remain separate. No paper-level performance claim is made.
+
 ## Verification
 
 Run tests from a disposable working directory: repository test fixtures may
